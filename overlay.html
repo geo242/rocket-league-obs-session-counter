@@ -1,0 +1,270 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RL Session W-L</title>
+<!--
+  Rocket League session win/loss counter, tracked per game mode, for an OBS browser source.
+  Everything comes from Rocket League's official Stats API websocket (TAGame\Config\DefaultStatsAPI.ini, WebPort):
+  match results, your team (the camera target) and the playlist (Game.PlaylistId).
+
+  URL options (append to the file path, e.g. rl-session.html?leaveCountsAsLoss=1):
+    port=49124             Stats API WebPort
+    names=73:Heatseeker    name playlists this file doesn't know (comma separated id:name pairs)
+    resetAfterHours=4      start a fresh session after this many hours without a counted game
+    leaveCountsAsLoss=1    count leaving a match before it ends as a loss
+    alwaysShow=1           stay visible even when Rocket League isn't running
+    debug=1                show connection/match status under the counter
+
+  Fix or reset by hand: in OBS, right-click the source > Interact, hover, then use +W / -W / +L / -L or "reset".
+  Each match's outcome (counted, or why it was skipped) is kept in localStorage under rl-session-v2-log.
+-->
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; font-family: "Segoe UI", sans-serif; }
+  #box { padding: 4px 10px; opacity: 0; transition: opacity .6s; }
+  #box.on { opacity: 1; }
+  #mode { color: #B8B0C8; font-size: 17px; font-weight: 600; letter-spacing: 2.5px; text-transform: uppercase; white-space: nowrap; }
+  #row { display: flex; align-items: center; gap: 10px; }
+  .n { font-size: 58px; font-weight: 700; line-height: 1.05; display: inline-block; }
+  .w { color: #4ADE80; }
+  .l { color: #F87171; }
+  .dash { color: #5B5368; font-size: 40px; font-weight: 700; }
+  #streak { color: #9146FF; font-size: 16px; font-weight: 600; line-height: 1.15; margin-left: 6px; width: 70px; }
+  .pop { animation: pop .7s ease-out; }
+  @keyframes pop { 0% { transform: scale(1.6); } 100% { transform: scale(1); } }
+  #debug { color: #B8B0C8; font: 11px Consolas, monospace; padding: 0 10px; white-space: pre; }
+  #controls { position: fixed; right: 4px; top: 4px; display: flex; gap: 3px; opacity: 0; }
+  body:hover #controls { opacity: 1; }
+  #controls button { font: 12px "Segoe UI"; color: #fff; background: #9146FF; border: 0; border-radius: 4px; padding: 3px 6px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div id="box">
+    <div id="mode">Session</div>
+    <div id="row"><span class="n w" id="w">0</span><span class="dash">&ndash;</span><span class="n l" id="l">0</span><span id="streak"></span></div>
+  </div>
+  <div id="debug" hidden></div>
+  <div id="controls">
+    <button data-adj="w:1" title="Add a win">+W</button><button data-adj="w:-1" title="Remove a win">&minus;W</button>
+    <button data-adj="l:1" title="Add a loss">+L</button><button data-adj="l:-1" title="Remove a loss">&minus;L</button>
+    <button id="reset" title="Reset the whole session">reset</button>
+  </div>
+
+<script>
+const P = new URLSearchParams(location.search);
+const PORT = P.get('port') || '49124';
+const RESET_AFTER_MS = (parseFloat(P.get('resetAfterHours')) || 4) * 3600e3;
+const LEAVE_IS_LOSS = P.get('leaveCountsAsLoss') === '1';
+const ALWAYS_SHOW = P.get('alwaysShow') === '1';
+const DEBUG = P.get('debug') === '1';
+const KEY = 'rl-session-v2';
+
+const PLAYLISTS = {
+  1: 'Casual 1v1', 2: 'Casual 2v2', 3: 'Casual 3v3', 4: 'Casual 4v4',
+  6: 'Private Match',
+  10: 'Ranked 1v1', 11: 'Ranked 2v2', 13: 'Ranked 3v3', 61: 'Ranked 4v4',
+  27: 'Ranked Hoops', 28: 'Ranked Rumble', 29: 'Ranked Dropshot', 30: 'Ranked Snow Day',
+  34: 'Tournament', 63: 'Heatseeker',
+};
+for (const pair of (P.get('names') || '').split(',')) {
+  const [id, ...name] = pair.split(':');
+  if (id && name.length) PLAYLISTS[id.trim()] = name.join(':').trim();
+}
+
+const $ = id => document.getElementById(id);
+let session = load();
+let match = null;      // { guid, votes: [blue, orange], players, started, counted, playlist }
+let connected = false;
+const ended = new Set();   // matches already destroyed; late events for them are ignored
+
+function fresh() { return { modes: {}, current: null, t: Date.now(), done: [] }; }
+function load() {
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY));
+    if (s && s.modes && Date.now() - s.t < RESET_AFTER_MS) return s;
+  } catch (e) {}
+  return fresh();
+}
+function save() {
+  session.t = Date.now();
+  try { localStorage.setItem(KEY, JSON.stringify(session)); } catch (e) {}
+}
+function rec(mode) { return session.modes[mode] || (session.modes[mode] = { w: 0, l: 0, streak: 0 }); }
+
+// ---- game mode ----
+function setMode(name) {
+  if (session.current !== name) { session.current = name; save(); }
+  render();
+}
+function teamSizeLabel() {
+  const c = [0, 0];
+  for (const p of match.players) if (p.TeamNum === 0 || p.TeamNum === 1) c[p.TeamNum]++;
+  const n = Math.max(c[0], c[1]);
+  return n ? `${n}v${n}` : null;
+}
+function updateMode(game) {
+  const pid = Number(game.PlaylistId);
+  if (pid > 0) {
+    if (match.playlist !== pid) {
+      match.playlist = pid;
+      setMode(PLAYLISTS[pid] || `Playlist ${pid}`);
+    }
+  } else if (!match.playlist && !match.sizeLabel) {
+    // no playlist (offline/local match): fall back to the team size
+    const size = teamSizeLabel();
+    if (size) { match.sizeLabel = size; setMode(size); }
+  }
+}
+
+// ---- display ----
+function render(popped) {
+  const mode = session.current;
+  const r = mode ? rec(mode) : { w: 0, l: 0, streak: 0 };
+  $('mode').textContent = mode || 'Session';
+  $('w').textContent = r.w;
+  $('l').textContent = r.l;
+  const s = r.streak;
+  $('streak').textContent = s >= 2 ? `${s} win streak` : s <= -2 ? `${-s} loss streak` : '';
+  $('box').classList.toggle('on', connected || ALWAYS_SHOW);
+  if (popped) {
+    const el = $(popped);
+    el.classList.remove('pop'); void el.offsetWidth; el.classList.add('pop');
+  }
+  if (DEBUG) {
+    $('debug').hidden = false;
+    $('debug').textContent = `ws:${connected ? 'connected' : 'waiting'}  playlist:${match && match.playlist || '-'}`
+      + `\nmatch:${match ? match.guid.slice(0, 8) : '-'}  myTeam:${match ? myTeam() : '-'}  humans:${match ? humanOpponent() : '-'}  counted:${match ? match.counted : '-'}`;
+  }
+}
+
+// ---- match tracking ----
+function newMatch(guid) {
+  match = { guid, votes: [0, 0], players: [], started: false, counted: session.done.includes(guid), playlist: null, humanSeen: false };
+}
+// short per-match history so a missed result can be explained later
+function logMatch(result) {
+  try {
+    const h = JSON.parse(localStorage.getItem(KEY + '-log') || '[]');
+    h.push({ t: new Date().toLocaleTimeString(), g: match.guid.slice(0, 8), p: match.playlist, team: myTeam(),
+             human: match.humanSeen, players: match.players.length, result });
+    localStorage.setItem(KEY + '-log', JSON.stringify(h.slice(-30)));
+  } catch (e) {}
+}
+function myTeam() {
+  if (!match) return null;
+  const [b, o] = match.votes;
+  if (b === 0 && o === 0) return null;
+  return b >= o ? 0 : 1;
+}
+function isBot(p) {
+  const id = String(p.PrimaryId ?? p.primaryId ?? '');
+  return id === '' || /^unknown/i.test(id);
+}
+function humanOpponent() {
+  const mine = myTeam();
+  return match.players.some(p => (p.TeamNum === 0 || p.TeamNum === 1) && p.TeamNum !== mine && !isBot(p));
+}
+
+function record(winnerTeam) {
+  if (!match || match.counted || (winnerTeam !== 0 && winnerTeam !== 1)) return;
+  const mine = myTeam();
+  if (mine === null) { if (!match.skipLogged) { match.skipLogged = true; logMatch('skip: team unknown'); } return; }
+  // opponents who quit vanish from the player list, so remember having seen one
+  if (!match.humanSeen && !humanOpponent()) { if (!match.skipLogged) { match.skipLogged = true; logMatch('skip: no human opponent'); } return; }
+  match.counted = true;
+  logMatch(winnerTeam === mine ? 'W' : 'L');
+  session.done = session.done.concat(match.guid).slice(-50);
+  const mode = session.current || teamSizeLabel() || 'Session';
+  if (!session.current) session.current = mode;
+  const r = rec(mode);
+  if (winnerTeam === mine) {
+    r.w++; r.streak = r.streak > 0 ? r.streak + 1 : 1;
+    save(); render('w');
+  } else {
+    r.l++; r.streak = r.streak < 0 ? r.streak - 1 : -1;
+    save(); render('l');
+  }
+}
+
+function winnerFromGame(g) {
+  const w = g.Winner;
+  if (w === 0 || w === 1) return w;
+  if (Array.isArray(g.Teams)) {
+    const t = g.Teams.find(t => t.Name === w);
+    if (t && (t.TeamNum === 0 || t.TeamNum === 1)) return t.TeamNum;
+  }
+  if (/blue/i.test(String(w))) return 0;
+  if (/orange/i.test(String(w))) return 1;
+  return null;
+}
+
+function handle(raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch (e) { return; }
+  const ev = msg.Event ?? msg.event;
+  let d = msg.Data ?? msg.data ?? {};
+  if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = {}; } }
+  const guid = d.MatchGuid || d.matchGuid;
+  if (guid && ended.has(guid)) return;
+
+  if (ev === 'MatchCreated' || ev === 'MatchInitialized') {
+    if (!match || (guid && guid !== match.guid)) newMatch(guid || 'm' + Date.now());
+  } else if (guid && (!match || guid !== match.guid)) {
+    newMatch(guid);
+  } else if (!match && ev === 'UpdateState') {
+    newMatch('m' + Date.now());
+  }
+
+  if (ev === 'UpdateState') {
+    const g = d.Game || {};
+    if (Array.isArray(d.Players)) match.players = d.Players;
+    updateMode(g);
+    const t = g.Target;
+    if (g.bHasTarget && t && (t.TeamNum === 0 || t.TeamNum === 1) && !g.bReplay) match.votes[t.TeamNum]++;
+    if (!match.humanSeen && myTeam() !== null && humanOpponent()) match.humanSeen = true;
+    if (g.bHasWinner) record(winnerFromGame(g));
+  } else if (ev === 'RoundStarted' || ev === 'CountdownBegin') {
+    if (match) match.started = true;
+  } else if (ev === 'MatchEnded') {
+    const w = d.WinnerTeamNum ?? d.winnerTeamNum;
+    if (w === 0 || w === 1) record(w);
+  } else if (ev === 'MatchDestroyed' || ev === 'GameLeft') {
+    if (match && !match.counted && match.started && LEAVE_IS_LOSS) {
+      const mine = myTeam();
+      if (mine !== null) record(1 - mine);
+    }
+    if (match && !match.counted && !match.skipLogged && match.players.length) logMatch('no result (left or cancelled)');
+    if (match) ended.add(match.guid);
+    if (guid) ended.add(guid);
+    if (ended.size > 100) ended.delete(ended.values().next().value);
+    match = null;
+  }
+  if (DEBUG) render();
+}
+
+function connect() {
+  let ws;
+  try { ws = new WebSocket(`ws://127.0.0.1:${PORT}`); } catch (e) { setTimeout(connect, 3000); return; }
+  ws.onopen = () => { connected = true; render(); };
+  ws.onmessage = e => handle(e.data);
+  ws.onclose = () => { connected = false; match = null; render(); setTimeout(connect, 3000); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+$('reset').onclick = () => { session = fresh(); save(); render(); };
+// manual fixes for the mode on screen (OBS: right-click the source > Interact)
+for (const b of document.querySelectorAll('[data-adj]')) {
+  b.onclick = () => {
+    const [k, n] = b.dataset.adj.split(':');
+    const r = rec(session.current || 'Session');
+    if (!session.current) session.current = 'Session';
+    r[k] = Math.max(0, r[k] + Number(n));
+    if (Number(n) > 0) r.streak = k === 'w' ? Math.max(r.streak, 0) + 1 : Math.min(r.streak, 0) - 1;
+    save(); render(k);
+  };
+}
+render();
+connect();
+</script>
+</body>
+</html>
