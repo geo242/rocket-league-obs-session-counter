@@ -8,11 +8,12 @@
   Everything comes from Rocket League's official Stats API websocket (TAGame\Config\DefaultStatsAPI.ini, WebPort):
   match results, your team (the camera target) and the playlist (Game.PlaylistId).
 
-  URL options (append to the file path, e.g. rl-session.html?leaveCountsAsLoss=1):
+  URL options (append to the file path, e.g. overlay.html?resetAfterHours=6):
     port=49124             Stats API WebPort
     names=73:Heatseeker    name playlists this file doesn't know (comma separated id:name pairs)
     resetAfterHours=4      start a fresh session after this many hours without a counted game
-    leaveCountsAsLoss=1    count leaving a match before it ends as a loss
+    leaveCountsAsLoss=0    don't count leaving a match before it ends (by default it's a loss,
+                           taken back if you reconnect to the same match)
     alwaysShow=1           stay visible even when Rocket League isn't running
     debug=1                show connection/match status under the counter
 
@@ -54,7 +55,7 @@
 const P = new URLSearchParams(location.search);
 const PORT = P.get('port') || '49124';
 const RESET_AFTER_MS = (parseFloat(P.get('resetAfterHours')) || 4) * 3600e3;
-const LEAVE_IS_LOSS = P.get('leaveCountsAsLoss') === '1';
+const LEAVE_IS_LOSS = P.get('leaveCountsAsLoss') !== '0';
 const ALWAYS_SHOW = P.get('alwaysShow') === '1';
 const DEBUG = P.get('debug') === '1';
 const KEY = 'rl-session-v2';
@@ -90,6 +91,37 @@ function save() {
   try { localStorage.setItem(KEY, JSON.stringify(session)); } catch (e) {}
 }
 function rec(mode) { return session.modes[mode] || (session.modes[mode] = { w: 0, l: 0, streak: 0 }); }
+
+// ---- leaving early ----
+// A match you leave before it ends counts as a loss. If you then reconnect to the same match
+// (ranked reconnect), that loss is taken back and the real result is counted instead.
+const RECONNECT_AFTER_MS = 5000;   // late messages from a match you just left aren't a reconnect
+function recordLeave() {
+  const mine = myTeam();
+  if (mine === null || !(match.humanSeen || humanOpponent())) return;
+  const mode = session.current || teamSizeLabel() || 'Session';
+  session.leaves = session.leaves || {};
+  session.leaves[match.guid] = { mode, prevStreak: rec(mode).streak, at: Date.now() };
+  const keys = Object.keys(session.leaves);
+  if (keys.length > 20) delete session.leaves[keys[0]];
+  match.leftEarly = true;
+  record(1 - mine);
+}
+function isReconnect(guid, ev) {
+  const x = session.leaves && session.leaves[guid];
+  return !!x && ev === 'UpdateState' && Date.now() - x.at > RECONNECT_AFTER_MS;
+}
+function undoLeave(guid) {
+  const x = session.leaves[guid];
+  const r = rec(x.mode);
+  r.l = Math.max(0, r.l - 1);
+  r.streak = x.prevStreak;
+  session.done = session.done.filter(g => g !== guid);
+  delete session.leaves[guid];
+  ended.delete(guid);
+  save();
+  render();
+}
 
 // ---- game mode ----
 function setMode(name) {
@@ -172,7 +204,7 @@ function record(winnerTeam) {
   // opponents who quit vanish from the player list, so remember having seen one
   if (!match.humanSeen && !humanOpponent()) { if (!match.skipLogged) { match.skipLogged = true; logMatch('skip: no human opponent'); } return; }
   match.counted = true;
-  logMatch(winnerTeam === mine ? 'W' : 'L');
+  logMatch(winnerTeam === mine ? 'W' : match.leftEarly ? 'L (left early)' : 'L');
   session.done = session.done.concat(match.guid).slice(-50);
   const mode = session.current || teamSizeLabel() || 'Session';
   if (!session.current) session.current = mode;
@@ -205,7 +237,12 @@ function handle(raw) {
   let d = msg.Data ?? msg.data ?? {};
   if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = {}; } }
   const guid = d.MatchGuid || d.matchGuid;
-  if (guid && ended.has(guid)) return;
+  if (guid && isReconnect(guid, ev)) {
+    undoLeave(guid);
+    if (match && match.guid === guid) match = null;
+    newMatch(guid);
+    logMatch('reconnected: leave undone');
+  } else if (guid && ended.has(guid)) return;
 
   if (ev === 'MatchCreated' || ev === 'MatchInitialized') {
     if (!match || (guid && guid !== match.guid)) newMatch(guid || 'm' + Date.now());
@@ -229,10 +266,7 @@ function handle(raw) {
     const w = d.WinnerTeamNum ?? d.winnerTeamNum;
     if (w === 0 || w === 1) record(w);
   } else if (ev === 'MatchDestroyed' || ev === 'GameLeft') {
-    if (match && !match.counted && match.started && LEAVE_IS_LOSS) {
-      const mine = myTeam();
-      if (mine !== null) record(1 - mine);
-    }
+    if (match && !match.counted && match.started && LEAVE_IS_LOSS) recordLeave();
     if (match && !match.counted && !match.skipLogged && match.players.length) logMatch('no result (left or cancelled)');
     if (match) ended.add(match.guid);
     if (guid) ended.add(guid);

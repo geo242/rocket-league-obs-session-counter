@@ -41,7 +41,8 @@ Play a match. The overlay appears while Rocket League is running, and it updates
 - **Counted:** matches against real players, in any online playlist or a private match. Your team is the player the game's camera follows, so it works on any of your accounts without setup.
 - **Opponents who quit:** a win when opponents leave still counts.
 - **Not counted:** free play, training, and matches against bots.
-- **Leaving early** isn't counted by default. Add `?leaveCountsAsLoss=1` to count it as a loss.
+- **Forfeits** count as a loss. The match ends normally with the other team winning.
+- **Leaving early** counts as a loss, as it does in ranked, provided the match had kicked off. If you reconnect to the same match (ranked reconnect), the loss is taken back and the real result counts instead. Add `?leaveCountsAsLoss=0` to ignore matches you leave.
 - **Each stream starts at 0–0.** After 4 hours without a counted match, the next one starts a new session. The counts survive OBS restarts.
 
 ## Fixing a count
@@ -55,11 +56,11 @@ Viewers can see the buttons while you hover.
 
 ## Options
 
-Add these to the end of the file path in the browser source, e.g. `overlay.html?leaveCountsAsLoss=1&resetAfterHours=6`:
+Add these to the end of the file path in the browser source, e.g. `overlay.html?resetAfterHours=6&alwaysShow=1`:
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `leaveCountsAsLoss=1` | off | Count leaving a match before it ends as a loss |
+| `leaveCountsAsLoss=0` | on | Ignore matches you leave before they end, instead of counting a loss |
 | `resetAfterHours=4` | `4` | Hours without a counted match before a new session starts |
 | `names=73:Heatseeker` | | Name playlists the overlay doesn't know, as comma-separated `id:name` pairs. Unknown ones show as `Playlist 73` |
 | `alwaysShow=1` | off | Stay visible when Rocket League isn't running (handy for positioning) |
